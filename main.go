@@ -7,6 +7,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"gitlab.com/UrsusArcTech/logger"
 )
 
 // Monitor represents one monitor as returned by hyprctl monitors -j.
@@ -23,13 +25,15 @@ func main() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	var lastConfig string        // last configuration type ("internal", "external" or "")
-	var lastChangeTime time.Time // the time when the configuration last changed
+	var lastConfig string     // The last known config ("internal", "external", or "")
+	var stableCount int       // Consecutive stable checks for the same config
+	const stableThreshold = 3 // Number of consecutive checks required
+	logger.LogMessage("Started")
 
 	for range ticker.C {
 		monitors, err := getMonitors()
 		if err != nil {
-			fmt.Println("Error retrieving monitors:", err)
+			logger.LogError(fmt.Sprintf("Error retrieving monitors: %v", err))
 			continue
 		}
 
@@ -38,16 +42,16 @@ func main() {
 			descriptions = append(descriptions, strings.TrimSpace(m.Description))
 		}
 
-		// Determine current configuration
 		var currentConfig string
 		var configPath string
 
-		// If there is exactly one monitor and it is the internal monitor.
+		// When there's only one monitor, assume internal.
 		if len(descriptions) == 1 && descriptions[0] == internalDesc {
 			currentConfig = "internal"
 			configPath = "/home/carl/.config/waybar/config-internal-monitor"
 		} else if len(descriptions) == 4 {
-			// Look for at least one external/dell monitor among the monitors.
+			// External configuration applies only when exactly 4 displays are detected.
+			// You may add further checks to verify that at least one external monitor matches.
 			for _, desc := range descriptions {
 				if desc == externalDesc {
 					currentConfig = "external"
@@ -57,20 +61,27 @@ func main() {
 			}
 		}
 
-		// If we did not recognize a valid configuration, skip this iteration.
+		// If we don't recognize a valid configuration, reset debouncing and continue.
 		if currentConfig == "" {
+			stableCount = 0
 			continue
 		}
 
-		// Only take action if the configuration has changed.
-		if currentConfig != lastConfig {
-			fmt.Printf("Configuration change detected: %s (previous: %s). Restarting waybar...\n", currentConfig, lastConfig)
+		// Increase our stability counter if the configuration hasn't changed.
+		if currentConfig == lastConfig {
+			stableCount++
+		} else {
+			stableCount = 1
+		}
+
+		// Only act if the configuration is stable for the prescribed threshold and it is a change.
+		if stableCount >= stableThreshold && currentConfig != lastConfig {
+			logger.LogMessage(fmt.Sprintf("Configuration change detected: %s (previous: %s). Restarting waybar...", currentConfig, lastConfig))
 			if err := restartWaybar(configPath); err != nil {
-				fmt.Printf("Error restarting waybar with %s config: %v\n", currentConfig, err)
+				logger.LogError(fmt.Sprintf("Error restarting waybar with %s config: %v", currentConfig, err))
 			} else {
 				lastConfig = currentConfig
-				lastChangeTime = time.Now()
-				fmt.Printf("Waybar restarted at %s with %s configuration.\n", lastChangeTime.Format(time.RFC1123), currentConfig)
+				logger.LogMessage(fmt.Sprintf("Waybar restarted with %s configuration.", currentConfig))
 			}
 		}
 	}
@@ -91,25 +102,23 @@ func getMonitors() ([]Monitor, error) {
 	return monitors, nil
 }
 
-// restartWaybar kills any existing waybar process (that is not our child) and starts a new one with the provided config.
-// It uses "pkill" with the "-x" flag to kill only processes named exactly "waybar" then launches a new instance detached from our process.
+// restartWaybar kills any existing waybar process (that is not our child)
+// and starts a new one with the provided config. It uses "pkill" to match the process name exactly.
 func restartWaybar(configPath string) error {
-	// Kill any running waybar processes.
+	// Kill any running waybar process.
 	killCmd := exec.Command("pkill", "-x", "waybar")
 	if err := killCmd.Run(); err != nil {
-		// Warn if pkill returns an error (it might happen if waybar is not running).
-		fmt.Println("Warning: pkill waybar resulted in an error (it might not be running):", err)
+		logger.LogWarning(fmt.Sprintf("Warning: pkill waybar resulted in an error (it might not be running): %v", err))
 	}
 
-	// Start waybar with the desired configuration.
+	// Start waybar with the specified configuration, detached from this process.
 	startCmd := exec.Command("waybar", "--config", configPath)
-	// Detach the process so it doesn't become our child.
 	startCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := startCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start waybar: %w", err)
 	}
 
-	fmt.Printf("Started waybar (PID %d) with config %s\n", startCmd.Process.Pid, configPath)
+	logger.LogMessage(fmt.Sprintf("Started waybar (PID %d) with config %s", startCmd.Process.Pid, configPath))
 	return nil
 }
